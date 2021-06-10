@@ -81,7 +81,7 @@ public:
   };
 
   mkdeps ()
-    : module_name (NULL), cmi_name (NULL), is_header_unit (false), quote_lwm (0)
+    : primary_output (NULL), module_name (NULL), cmi_name (NULL), is_header_unit (false), is_exported (false), quote_lwm (0)
   {
   }
   ~mkdeps ()
@@ -90,6 +90,9 @@ public:
 
     for (i = targets.size (); i--;)
       free (const_cast <char *> (targets[i]));
+    free (const_cast <char *> (primary_output));
+    for (i = outputs.size (); i--;)
+      free (const_cast <char *> (outputs[i]));
     for (i = deps.size (); i--;)
       free (const_cast <char *> (deps[i]));
     for (i = vpath.size (); i--;)
@@ -103,6 +106,8 @@ public:
 public:
   vec<const char *> targets;
   vec<const char *> deps;
+  const char * primary_output;
+  vec<const char *> outputs;
   vec<velt> vpath;
   vec<const char *> modules;
 
@@ -110,6 +115,7 @@ public:
   const char *module_name;
   const char *cmi_name;
   bool is_header_unit;
+  bool is_exported;
   unsigned short quote_lwm;
 };
 
@@ -288,6 +294,20 @@ deps_add_default_target (class mkdeps *d, const char *tgt)
     }
 }
 
+/* Adds an output O.  We make a copy, so it need not be a permanent
+   string.  */
+void
+deps_add_output (struct mkdeps *d, const char *o, bool is_primary)
+{
+  o = apply_vpath (d, o);
+  if (is_primary) {
+    if (d->primary_output)
+      d->outputs.push (d->primary_output);
+    d->primary_output = xstrdup (o);
+  } else
+    d->outputs.push (xstrdup (o));
+}
+
 void
 deps_add_dep (class mkdeps *d, const char *t)
 {
@@ -325,12 +345,13 @@ deps_add_vpath (class mkdeps *d, const char *vpath)
 
 void
 deps_add_module_target (struct mkdeps *d, const char *m,
-			const char *cmi, bool is_header_unit)
+			const char *cmi, bool is_header_unit, bool is_exported)
 {
   gcc_assert (!d->module_name);
   
   d->module_name = xstrdup (m);
   d->is_header_unit = is_header_unit;
+  d->is_exported = is_exported;
   d->cmi_name = xstrdup (cmi);
 }
 
@@ -387,7 +408,7 @@ make_write_vec (const mkdeps::vec<const char *> &vec, FILE *fp,
    .PHONY targets for all the dependencies too.  */
 
 static void
-make_write (const cpp_reader *pfile, FILE *fp, unsigned int colmax)
+make_write (const cpp_reader *pfile, FILE *fp, unsigned int colmax, int extra)
 {
   const mkdeps *d = pfile->deps;
 
@@ -398,7 +419,7 @@ make_write (const cpp_reader *pfile, FILE *fp, unsigned int colmax)
   if (d->deps.size ())
     {
       column = make_write_vec (d->targets, fp, 0, colmax, d->quote_lwm);
-      if (CPP_OPTION (pfile, deps.modules) && d->cmi_name)
+      if (extra && CPP_OPTION (pfile, deps.modules) && d->cmi_name)
 	column = make_write_name (d->cmi_name, fp, column, colmax);
       fputs (":", fp);
       column++;
@@ -412,7 +433,7 @@ make_write (const cpp_reader *pfile, FILE *fp, unsigned int colmax)
   if (!CPP_OPTION (pfile, deps.modules))
     return;
 
-  if (d->modules.size ())
+  if (extra && d->modules.size ())
     {
       column = make_write_vec (d->targets, fp, 0, colmax, d->quote_lwm);
       if (d->cmi_name)
@@ -423,7 +444,7 @@ make_write (const cpp_reader *pfile, FILE *fp, unsigned int colmax)
       fputs ("\n", fp);
     }
 
-  if (d->module_name)
+  if (extra && d->module_name)
     {
       if (d->cmi_name)
 	{
@@ -455,7 +476,7 @@ make_write (const cpp_reader *pfile, FILE *fp, unsigned int colmax)
 	}
     }
   
-  if (d->modules.size ())
+  if (extra && d->modules.size ())
     {
       column = fprintf (fp, "CXX_IMPORTS +=");
       make_write_vec (d->modules, fp, column, colmax, 0, ".c++m");
@@ -468,9 +489,204 @@ make_write (const cpp_reader *pfile, FILE *fp, unsigned int colmax)
 /* Really we should be opening fp here.  */
 
 void
-deps_write (const cpp_reader *pfile, FILE *fp, unsigned int colmax)
+deps_write (const struct cpp_reader *pfile, FILE *fp, unsigned int colmax, int extra)
 {
-  make_write (pfile, fp, colmax);
+  make_write (pfile, fp, colmax, extra);
+}
+
+static bool
+is_utf8 (const char *name)
+{
+  int byte_length = 0;
+  int expected_continuations = 0;
+  uint32_t codepoint = 0;
+
+  for (const char* c = name; *c; c++)
+    {
+      int byte = *c;
+
+      // Check for a continuation character.
+      if ((byte & 0xc0) == 0x80) // 10xx_xxxx
+	{
+	  --expected_continuations;
+
+	  if (expected_continuations < 0)
+	    return false;
+
+	  // Add the encoded bits to the codepoint.
+	  codepoint = (codepoint << 6) + (byte & ~0x3f);
+
+	  continue;
+	}
+
+      // Make sure we don't expect more continuation characters
+      // once we don't find one.
+      if (expected_continuations != 0)
+	return false;
+
+      // Invalid because if they appear, it is an attempt to encode an ASCII
+      // character in 2 bytes.
+      if (byte == 0xc0 || byte == 0xc1) // 1100_0000 || 1100_0001
+	return false;
+
+      // Invalid because they would encode codepoints greater than allowed
+      // (0x10FFFF).
+      if (byte > 0xf4)
+	return false;
+
+      // ED-prefixed sequence encoding UTF-16 surrogate halves.
+      if (0xD0FF <= codepoint && codepoint <= 0xDFFF)
+	return false;
+
+      // 0x10FFFF is the highest valid codepoint for UTF-8.
+      if (0x10FFFF < codepoint)
+	return false;
+
+      // Overlong encoding of a codepoint.
+      if (byte_length == 2 && codepoint < 0x0800)
+	return false;
+      if (byte_length == 3 && codepoint < 0x10000)
+	return false;
+
+      // Single byte character.
+      if ((byte & 0x80) == 0x00) // 0xxx_xxxx
+	{
+	  codepoint = byte;
+	  byte_length = expected_continuations = 0;
+	}
+      // Prefix codes.
+      else if ((byte & 0xe0) == 0xc0) // 110x_xxxx
+	{
+	  codepoint = byte & 0x1f;
+	  byte_length = expected_continuations = 1;
+	}
+      else if ((byte & 0xf0) == 0xe0) // 1110_xxxx
+	{
+	  codepoint = byte & 0x0f;
+	  byte_length = expected_continuations = 2;
+	}
+      else if ((byte & 0xf8) == 0xf0) // 1111_0xxx
+	{
+	  codepoint = byte & 0x07;
+	  byte_length = expected_continuations = 3;
+	}
+      else
+	return false;
+    }
+
+  if (expected_continuations != 0)
+    return false;
+
+  return true;
+}
+
+static void
+trtbd_write_filepath (const char *name, FILE *fp)
+{
+  if (is_utf8 (name))
+    {
+      fputc ('"', fp);
+      for (const char* c = name; *c; c++)
+	{
+	  // Escape control characters.
+	  if (ISCNTRL (*c))
+	    fprintf (fp, "\\u%04x", *c);
+	  // JSON escape characters.
+	  else if (*c == '"' || *c == '\\')
+	    {
+	      fputc ('\\', fp);
+	      fputc (*c, fp);
+	    }
+	  // Everything else.
+	  else
+	    fputc (*c, fp);
+	}
+      fputc ('"', fp);
+    }
+  else
+    {
+      // TODO: print an error
+    }
+}
+
+static void
+trtbd_write_vec (const mkdeps::vec<const char *> &vec, FILE *fp)
+{
+  for (unsigned ix = 0; ix != vec.size (); ix++)
+    {
+      trtbd_write_filepath (vec[ix], fp);
+      if (ix < vec.size () - 1)
+	fputc (',', fp);
+      fputc ('\n', fp);
+    }
+}
+
+void
+deps_write_trtbd (const struct mkdeps *d, FILE *fp)
+{
+  fputs ("{\n", fp);
+
+  fputs ("\"rules\": [\n", fp);
+  fputs ("{\n", fp);
+
+  // work-directory
+
+  if (d->primary_output)
+    {
+      fputs ("\"primary-output\": ", fp);
+      trtbd_write_filepath (d->primary_output, fp);
+      fputs (",\n", fp);
+    }
+
+  if (d->outputs.size ())
+    {
+      fputs ("\"outputs\": [\n", fp);
+      trtbd_write_vec (d->outputs, fp);
+      fputs ("],\n", fp);
+    }
+
+  if (d->module_name)
+    {
+      fputs ("\"provides\": [\n", fp);
+      fputs ("{\n", fp);
+
+      fputs ("\"logical-name\": ", fp);
+      trtbd_write_filepath (d->module_name, fp);
+      fputs (",\n", fp);
+
+      fprintf (fp, "\"is-interface\": %s\n", d->is_exported ? "true" : "false");
+
+      // other information
+
+      fputs ("}\n", fp);
+      fputs ("],\n", fp);
+    }
+
+  fputs ("\"requires\": [\n", fp);
+  for (size_t i = 0; i < d->modules.size (); i++)
+    {
+      if (i != 0)
+	fputs (",\n", fp);
+      fputs ("{\n", fp);
+
+      fputs ("\"logical-name\": ", fp);
+      trtbd_write_filepath (d->modules[i], fp);
+      fputs ("\n", fp);
+
+      // other information
+
+      fputs ("}\n", fp);
+    }
+  fputs ("]\n", fp);
+
+  fputs ("}\n", fp);
+
+  fputs ("],\n", fp);
+
+  fputs ("\"version\": 0,\n", fp);
+  fputs ("\"revision\": 0\n", fp);
+
+  fputs ("}\n", fp);
 }
 
 /* Write out a deps buffer to a file, in a form that can be read back

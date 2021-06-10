@@ -712,7 +712,7 @@ gfc_cpp_done (void)
 	  FILE *f = fopen (gfc_cpp_option.deps_filename, "w");
 	  if (f)
 	    {
-	      cpp_finish (cpp_in, f);
+	      cpp_finish (cpp_in, f, NULL);
 	      fclose (f);
 	    }
 	  else
@@ -721,7 +721,7 @@ gfc_cpp_done (void)
 			     xstrerror (errno));
 	}
       else
-	cpp_finish (cpp_in, stdout);
+	cpp_finish (cpp_in, stdout, NULL);
     }
 
   cpp_undef_all (cpp_in);

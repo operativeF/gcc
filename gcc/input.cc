@@ -2260,7 +2260,7 @@ test_lexer (const line_table_case &case_)
   ASSERT_NE (tok, NULL);
   ASSERT_EQ (tok->type, CPP_EOF);
 
-  cpp_finish (parser, NULL);
+  cpp_finish (parser, NULL, NULL);
   cpp_destroy (parser);
 }
 
@@ -2291,7 +2291,7 @@ class cpp_reader_ptr
 
   ~cpp_reader_ptr ()
   {
-    cpp_finish (m_ptr, NULL);
+    cpp_finish (m_ptr, NULL, NULL);
     cpp_destroy (m_ptr);
   }
 
